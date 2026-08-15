@@ -13,23 +13,39 @@ talks to two exchanges directly.
 
 ## How it works
 
-Three layers, each doing the job it is actually suited for.
+Four layers, each doing a job it is actually suited for.
 
-**Price momentum → who is winning.**
-Each coin's move over a rolling three-minute window is averaged, then run through
-`tanh(drift / 0.012)` to split a fixed 20,000-soldier field. A 1.2% move splits it about
-76/24; a 3% move is close to total. The `tanh` matters — without it a sharp move pins the
-field at one end and the battle stops being a battle.
+**The day's move → where the front line sits.**
+BTC's change over 24 hours positions the battle. A down day means the bears have already
+pushed into bull territory, and the bulls spend the session fighting uphill. Ground stays
+won — resetting the armies on a timer would make one side abruptly forget it had been
+winning all afternoon, which reads as a glitch rather than a war.
+
+**Three-minute momentum → the swing.**
+Recent price action shoves the line up to ±26% around that day position, through
+`tanh(drift / 0.012)`. The `tanh` matters: without it a sharp move pins the field at one end
+and the battle stops being a battle.
 
 **Trades → gunfire.**
-Every trade sends soldiers firing, with the trade's notional value deciding how many pull
-the trigger at once. Roughly 17 trades per second across both feeds, so the field is never
-still.
+Every trade sends soldiers firing, with the trade's notional deciding how many pull the
+trigger at once. Roughly 17 trades per second across both feeds, so the field is never still.
 
 **Sprites → a representative company.**
-The counters are the real army; the ~56 sprites on screen stand in for them. They die when
-hit and reinforcements march up from the rear, which keeps the screen busy without pretending
-each sprite is one of ten thousand soldiers.
+The counters are the real army; the sprites on screen stand in for them. Volley size and
+reinforcement rate scale with how many are actually deployed, so a smaller screen does not
+end up with an empty field.
+
+### The chart
+
+BTC price over 24 hours, against **cumulative volume delta** — buy notional minus sell
+notional, accumulated for the session.
+
+Trade *counts* are close to meaningless here. 349 buys against 140 sells looks like
+overwhelming demand, but price can sit flat through it: retail buys are many and small,
+institutional sells are few and large. Measured in dollars, pressure and price agree.
+
+The shaded region marks where live order flow begins — candles give a day of prices, but
+they cannot tell you the day's order flow, so CVD only exists from page load onward.
 
 ---
 
@@ -61,10 +77,14 @@ The scripts in [`research/`](research/) are the evidence for the table above.
 
 Both feeds run at once, normalised through a single entry point.
 
-| Source | Endpoint | Rate |
+| Source | Endpoint | Purpose |
 |---|---|---|
-| Coinbase | `wss://ws-feed.exchange.coinbase.com` — `matches` | ~10 trades/sec |
-| Hyperliquid | `wss://api.hyperliquid.xyz/ws` — `trades` | ~6.6 trades/sec |
+| Coinbase | `wss://ws-feed.exchange.coinbase.com` — `matches` | Live tape, ~10 trades/sec |
+| Hyperliquid | `wss://api.hyperliquid.xyz/ws` — `trades` | Live tape, ~6.6 trades/sec |
+| Coinbase | `/products/BTC-USD/candles?granularity=300` | 24h of history on load |
+
+The candles call returns ~29 hours at five-minute granularity, so the chart is useful the
+moment the page opens instead of after ten minutes of collecting.
 
 > **Gotcha worth knowing:** Coinbase's `side` field reports the **maker's** side, so the
 > aggressor is the opposite — a maker `"sell"` means the taker *bought*. Reading it the
@@ -134,8 +154,9 @@ iterations/     earlier versions, kept because the path is part of the work
 ```
 
 `iterations/` traces the build: abstract projectiles, then stick figures, then a version
-driven by aggressor flow that sat stubbornly at 50/50 because every trade has both a buyer
-and a seller. That flaw is what moved the mechanic to price.
+driven by aggressor flow that sat stubbornly at 50/50 — because every trade has both a buyer
+and a seller, so "buyers versus sellers" is even by definition. That flaw is what moved the
+mechanic to price.
 
 ---
 

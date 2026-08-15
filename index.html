@@ -87,6 +87,22 @@
   .sw-cvd { background: #8b7cf6; }
 
   .hint { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%); color: var(--dim); font-size: 13px; }
+
+  /* A shared link gets opened on a phone more often than not. Narrow screens
+     get a smaller army, tighter chrome, and no kill feed — the battle and the
+     chart are what matter; the feed is the first thing that can go. */
+  @media (max-width: 720px) {
+    header { padding: 12px 14px; gap: 8px; flex-wrap: nowrap; }
+    h1 { font-size: 13px; white-space: nowrap; }
+    .status { font-size: 10px; white-space: nowrap; }
+    .meter-wrap { top: 44px; left: 14px; right: 14px; }
+    .meter-labels { font-size: 10px; }
+    .price { top: 72px; width: calc(100% - 28px); max-width: 320px; padding: 7px 10px 5px; }
+    .pnow { font-size: 15px; }
+    #spark { width: 100%; height: 40px; }
+    .board { left: 14px; right: 14px; bottom: 14px; font-size: 11px; padding: 8px 11px; }
+    .feed { display: none; }
+  }
 </style>
 </head>
 <body>
@@ -117,13 +133,13 @@
 
   <div class="price">
     <div class="prow">
-      <span class="plabel">BTC</span>
+      <span class="plabel">BTC · 24H</span>
       <span class="pnow" id="btcPx">—</span>
       <span class="pchg" id="btcChg"></span>
     </div>
     <canvas id="spark" width="520" height="88"></canvas>
     <div class="legend">
-      <span><i class="sw-px"></i>price</span>
+      <span><i class="sw-px"></i>price · 24h</span>
       <span><i class="sw-cvd"></i>cumulative volume delta</span>
     </div>
   </div>
@@ -204,8 +220,9 @@ document.title = THEME.title + " — live tape";
 document.documentElement.style.setProperty("--a", "rgb(" + THEME.a.rgb + ")");
 document.documentElement.style.setProperty("--b", "rgb(" + THEME.b.rgb + ")");
 
-const PX = 3;                        // pixel scale
-const SW = 11 * PX, SH = 18 * PX;    // sprite size on screen
+const PX = 3;                        // pixel scale of the baked sprite
+let UNIT = 1;                        // display multiplier, set by layout()
+let SW = 11 * PX, SH = 18 * PX;      // sprite size on screen
 
 function shade(rgb, mul, mix) {
   const p = rgb.split(",").map(Number);
@@ -257,7 +274,7 @@ let W = 0, H = 0;
 const FORCE = 20000;         // total soldiers on the field, split by momentum
 const LOOKBACK = 180000;     // price window driving the war, ms
 const SENS = 0.012;          // move that swings the battle decisively (1.2%)
-const RANKS = 4, FILES = 7;
+let RANKS = 4, FILES = 7;            // thinned on narrow screens
 
 const S = {
   trades: 0, vol: 0, aArmy: FORCE / 2, bArmy: FORCE / 2,
@@ -272,7 +289,36 @@ const S = {
   // sells are few and large, so counting prints tells you nothing about price.
   btc: { px: null, open: null, cvd: 0, series: [], lastSample: 0 },
   buyVol: 0, sellVol: 0,
+
+  // Two timescales doing two jobs. The day's move decides where the front
+  // line sits — ground already won. Recent momentum swings the fighting
+  // around that position. A hard reset would make the bears forget they had
+  // been winning all afternoon, which reads as a glitch rather than a battle.
+  day: { series: [], open: null, change: 0, loaded: false },
 };
+
+const DAY_SENS = 0.03;     // a 3% day is a decisive rout
+const SWING = 0.26;        // how far 3-minute momentum can shove the line
+
+// One public REST call gives ~29h of 5-minute candles, so the chart is useful
+// the moment the page loads instead of after ten minutes of collecting.
+async function loadDay() {
+  try {
+    const r = await fetch("https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300");
+    const raw = await r.json();
+    if (!Array.isArray(raw)) return;
+    const cutoff = Date.now() / 1000 - 86400;
+    const rows = raw
+      .filter(c => Array.isArray(c) && c[0] >= cutoff)
+      .sort((a, b) => a[0] - b[0]);            // API returns newest first
+    if (rows.length < 2) return;
+    S.day.series = rows.map(c => ({ t: c[0] * 1000, p: c[4] }));
+    S.day.open = S.day.series[0].p;
+    S.day.loaded = true;
+  } catch (e) {
+    // offline or blocked — the battle still runs on the live tape alone
+  }
+}
 
 // Price is the war. Every coin contributes its move over the window; the
 // average decides how the field is split. Rising price means bulls are
@@ -311,17 +357,26 @@ function layout() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.imageSmoothingEnabled = false;
 
-  const top = 118, bot = H - 150;
-  const usable = Math.max(160, bot - top);
+  // Scale the army to the screen rather than letting it march off the edge.
+  const narrow = W < 720;
+  UNIT = narrow ? 0.72 : 1;
+  SW = 11 * PX * UNIT; SH = 18 * PX * UNIT;
+  RANKS = narrow ? 3 : 4;
+  FILES = narrow ? 5 : 7;
+
+  const top = narrow ? 150 : 118;
+  const bot = H - (narrow ? 150 : 150);
+  const usable = Math.max(120, bot - top);
   units.length = 0;
   for (const side of [0, 1]) {
     for (let r = 0; r < RANKS; r++) {
       for (let f = 0; f < FILES; f++) {
         const depth = r / Math.max(1, RANKS - 1);
+        const spread = narrow ? 0.20 : 0.26;
         const homeX = side === 0
-          ? W * 0.08 + depth * W * 0.26
-          : W * 0.92 - depth * W * 0.26;
-        const y = top + (usable * (f + 0.5)) / FILES + (r % 2 ? 11 : -11);
+          ? W * 0.08 + depth * W * spread
+          : W * 0.92 - depth * W * spread;
+        const y = top + (usable * (f + 0.5)) / FILES + (r % 2 ? 11 : -11) * UNIT;
         units.push({
           side, homeX, x: homeX, y, depth, rank: r,
           alive: true, dying: 0, respawn: 0,
@@ -347,7 +402,9 @@ function pick(side) {
 
 // --- combat ---------------------------------------------------------------
 function volley(attackerSide, notional) {
-  const shots = Math.max(1, Math.min(6, Math.round(Math.log10(1 + notional) - 1.6)));
+  const perSide = Math.max(1, units.length / 2);
+  const cap = Math.max(2, Math.round(perSide / 5));   // never wipe the line
+  const shots = Math.max(1, Math.min(cap, Math.round(Math.log10(1 + notional) - 1.6)));
   const heavy = notional > 120000;
 
   for (let i = 0; i < shots; i++) {
@@ -385,7 +442,9 @@ function frame() {
   // tanh keeps a 5% crash from pinning the field forever while still making
   // a 1% move clearly visible
   S.drift += (momentum() - S.drift) * 0.04;
-  const share = 0.5 + 0.5 * Math.tanh(S.drift / SENS);
+  const dayShare = 0.5 + 0.5 * Math.tanh(S.day.change / DAY_SENS);
+  const swing = Math.tanh(S.drift / SENS) * SWING;
+  const share = Math.max(0.05, Math.min(0.95, dayShare + swing));
   S.aArmy += (FORCE * share - S.aArmy) * 0.03;
   S.bArmy += (FORCE * (1 - share) - S.bArmy) * 0.03;
   const tot = S.aArmy + S.bArmy;
@@ -413,7 +472,12 @@ function frame() {
 
     if (u.dying) {
       u.dying -= 0.03;
-      if (u.dying <= 0) { u.dying = 0; u.alive = false; u.respawn = 70 + Math.random() * 90; }
+      if (u.dying <= 0) {
+        u.dying = 0; u.alive = false;
+        // small armies must reinforce faster or the field empties out
+        const rate = 28 / Math.max(1, units.length / 2);
+        u.respawn = (55 + Math.random() * 80) / Math.max(1, rate);
+      }
     } else if (!u.alive) {
       u.respawn -= 1;
       if (u.respawn <= 0) { u.alive = true; u.x = u.homeX - (u.side === 0 ? 80 : -80); }
@@ -433,7 +497,7 @@ function frame() {
       ctx.translate(u.x + kick, u.y + bob);
       ctx.globalAlpha = u.dying ? u.dying : (0.55 + (1 - u.depth) * 0.45);
       if (u.dying) ctx.rotate((u.side === 0 ? 1 : -1) * (1 - u.dying) * 1.5);
-      ctx.drawImage(img, -SW / 2, -SH);
+      ctx.drawImage(img, -SW / 2, -SH, SW, SH);
       ctx.restore();
 
       if (u.recoil > 0.5) {            // muzzle flash at the barrel
@@ -497,8 +561,9 @@ function paintStats() {
   if (b.px) {
     $("btcPx").textContent = "$" + b.px.toLocaleString(undefined,
       { minimumFractionDigits: 0, maximumFractionDigits: 0 });
-    if (b.open) {
-      const pc = ((b.px - b.open) / b.open) * 100;
+    const ref = S.day.open || b.open;
+    if (ref) {
+      const pc = ((b.px - ref) / ref) * 100;
       const el = $("btcChg");
       el.textContent = (pc >= 0 ? "+" : "") + pc.toFixed(2) + "%";
       el.style.color = pc >= 0 ? "var(--a)" : "var(--b)";
@@ -523,34 +588,40 @@ const spark = document.getElementById("spark");
 const sctx = spark.getContext("2d");
 
 function drawSpark() {
-  const pts = S.btc.series;
   const w = spark.width, h = spark.height, pad = 4;
   sctx.clearRect(0, 0, w, h);
-  if (pts.length < 2) {
+
+  const hist = S.day.series, live = S.btc.series;
+  const price = hist.concat(live);
+  if (price.length < 2) {
     sctx.fillStyle = "rgba(124,135,152,.7)";
     sctx.font = "20px ui-sans-serif, system-ui, sans-serif";
     sctx.textAlign = "center";
-    sctx.fillText("collecting…", w / 2, h / 2 + 8);
+    sctx.fillText("collecting…", w / 2, h / 2 + 7);
     return;
   }
 
+  // One time axis for both series. CVD only exists from page load, so it
+  // draws over the right-hand slice — which is honest: we cannot know the
+  // day's order flow from candles, only its prices.
+  const t0 = price[0].t, t1 = Math.max(price[price.length - 1].t, Date.now());
+  const span = Math.max(1, t1 - t0);
+  const X = t => pad + ((t - t0) / span) * (w - pad * 2);
+
   // A floor on the range matters: auto-scaling a $5 move on a $63,000 price
-  // fills the chart height and makes a flat market look violent. The floor
-  // keeps a genuinely quiet tape looking quiet.
-  const line = (get, colour, width, minSpan) => {
+  // fills the chart height and makes a flat market look violent.
+  const plot = (pts, get, colour, width, minSpan) => {
+    if (pts.length < 2) return;
     let lo = Infinity, hi = -Infinity;
     for (const q of pts) { const v = get(q); if (v < lo) lo = v; if (v > hi) hi = v; }
-    let span = hi - lo;
+    let range = hi - lo;
     const floor = minSpan || 0;
-    if (span < floor) {
-      const mid = (hi + lo) / 2;
-      lo = mid - floor / 2; hi = mid + floor / 2; span = floor;
-    }
-    if (!span) span = 1;
+    if (range < floor) { const mid = (hi + lo) / 2; lo = mid - floor / 2; hi = mid + floor / 2; range = floor; }
+    if (!range) range = 1;
     sctx.beginPath();
     pts.forEach((q, i) => {
-      const x = pad + (i / (pts.length - 1)) * (w - pad * 2);
-      const y = h - pad - ((get(q) - lo) / span) * (h - pad * 2);
+      const x = X(q.t);
+      const y = h - pad - ((get(q) - lo) / range) * (h - pad * 2);
       i ? sctx.lineTo(x, y) : sctx.moveTo(x, y);
     });
     sctx.strokeStyle = colour;
@@ -559,10 +630,22 @@ function drawSpark() {
     sctx.stroke();
   };
 
-  const last = pts[pts.length - 1];
-  // 0.4% of price, and CVD scaled against total session flow
-  line(q => q.c, "#8b7cf6", 3, Math.max(1, (S.buyVol + S.sellVol) * 0.05));
-  line(q => q.p, "#e8ecf1", 3, last.p * 0.004);
+  // Shade the region we have order flow for. Freshly loaded this is a sliver
+  // and grows as the page runs — shading it says "live data starts here"
+  // rather than leaving a stray purple mark that looks like a glitch.
+  if (hist.length && live.length) {
+    const x = X(live[0].t);
+    sctx.fillStyle = "rgba(139,124,246,.09)";
+    sctx.fillRect(x, pad, w - pad - x, h - pad * 2);
+    sctx.strokeStyle = "rgba(232,236,241,.16)";
+    sctx.lineWidth = 2;
+    sctx.setLineDash([3, 4]);
+    sctx.beginPath(); sctx.moveTo(x, pad); sctx.lineTo(x, h - pad); sctx.stroke();
+    sctx.setLineDash([]);
+  }
+
+  plot(live, q => q.c, "#8b7cf6", 3, Math.max(1, (S.buyVol + S.sellVol) * 0.05));
+  plot(price, q => q.p, "#e8ecf1", 3, price[price.length - 1].p * 0.004);
 }
 
 function pushKill(aSide, coin, notional) {
@@ -590,11 +673,12 @@ function onTrade(aSide, coin, notional, price) {
     b.px = price;
     if (b.open === null) b.open = price;
     b.cvd += aSide ? notional : -notional;
+    if (S.day.open) S.day.change = (price - S.day.open) / S.day.open;
     const now = Date.now();
     if (now - b.lastSample > 2000) {
       b.lastSample = now;
       b.series.push({ t: now, p: price, c: b.cvd });
-      if (b.series.length > 400) b.series.shift();
+      if (b.series.length > 900) b.series.shift();
     }
   }
 
@@ -654,6 +738,7 @@ function connectCoinbase() {
 }
 
 layout();
+loadDay();
 requestAnimationFrame(frame);
 connectCoinbase();
 connectHyperliquid();
