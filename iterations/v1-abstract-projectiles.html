@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bulls vs Bears — live perp tape</title>
+<style>
+  :root {
+    --bull: #22e5a0;
+    --bear: #ff4d6a;
+    --ink: #e8ecf1;
+    --dim: #7c8798;
+    --bg: #07090d;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 400 14px/1.45 ui-sans-serif, -apple-system, "SF Pro Text", Inter, system-ui, sans-serif;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+
+  .layer { position: fixed; inset: 0; pointer-events: none; }
+
+  header {
+    position: fixed; top: 0; left: 0; right: 0;
+    display: flex; align-items: baseline; gap: 14px;
+    padding: 20px 24px;
+  }
+  h1 { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+  .status { font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 6px; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--dim); }
+  .dot.live { background: var(--bull); box-shadow: 0 0 8px var(--bull); }
+  .dot.dead { background: var(--bear); }
+
+  /* war meter */
+  .meter-wrap { position: fixed; top: 58px; left: 24px; right: 24px; }
+  .meter {
+    height: 3px; width: 100%; border-radius: 2px;
+    background: var(--bear); overflow: hidden;
+  }
+  .meter > i { display: block; height: 100%; background: var(--bull); width: 50%; transition: width .35s cubic-bezier(.4,0,.2,1); }
+  .meter-labels { display: flex; justify-content: space-between; margin-top: 8px; font-size: 12px; }
+  .bull-t { color: var(--bull); } .bear-t { color: var(--bear); }
+  .num { font-variant-numeric: tabular-nums; }
+
+  /* scoreboard */
+  .board {
+    position: fixed; left: 24px; bottom: 24px;
+    font-size: 12px; color: var(--dim);
+    display: grid; grid-template-columns: auto auto; gap: 3px 16px;
+  }
+  .board b { color: var(--ink); font-weight: 500; font-variant-numeric: tabular-nums; }
+  .dimspan { opacity: .5; }
+  .feed .kill .amt { white-space: nowrap; }
+
+  /* kill feed */
+  .feed {
+    position: fixed; right: 24px; bottom: 24px; width: 290px;
+    display: flex; flex-direction: column-reverse; gap: 4px;
+    font-size: 12px; font-variant-numeric: tabular-nums;
+  }
+  .kill {
+    display: flex; justify-content: space-between; gap: 10px;
+    padding: 5px 9px; border-radius: 5px;
+    background: rgba(255,255,255,.04);
+    border-left: 2px solid var(--dim);
+    animation: slide .3s cubic-bezier(.2,0,0,1);
+  }
+  .kill.bull { border-left-color: var(--bull); }
+  .kill.bear { border-left-color: var(--bear); }
+  .kill .coin { color: var(--ink); font-weight: 500; }
+  .kill .amt { color: var(--dim); }
+  .kill.big { background: rgba(255,255,255,.09); }
+  .kill.big .amt { color: var(--ink); }
+  @keyframes slide { from { opacity: 0; transform: translateX(14px); } }
+
+  .hint { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%); color: var(--dim); font-size: 13px; text-align: center; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="layer">
+  <header>
+    <h1 id="title">Bulls vs Bears</h1>
+    <span class="status"><span class="dot" id="dot"></span><span id="stat">connecting…</span></span>
+  </header>
+
+  <div class="meter-wrap">
+    <div class="meter"><i id="bar"></i></div>
+    <div class="meter-labels">
+      <span class="bull-t"><span id="aName">BULLS</span> <span class="num" id="bullArmy">10,000</span></span>
+      <span class="bear-t"><span class="num" id="bearArmy">10,000</span> <span id="bName">BEARS</span></span>
+    </div>
+  </div>
+
+  <div class="board">
+    <span>trades</span><b id="nTrades">0</b>
+    <span>volume</span><b id="vol">$0</b>
+    <span><span id="aKillLbl">bull</span> kills <span class="dimspan">60s</span></span><b id="bullVol">0</b>
+    <span><span id="bKillLbl">bear</span> kills <span class="dimspan">60s</span></span><b id="bearVol">0</b>
+    <span>biggest hit</span><b id="biggest">—</b>
+  </div>
+
+  <div class="feed" id="feed"></div>
+  <div class="hint" id="hint">waiting for the tape…</div>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// Live perpetual-futures tape from Hyperliquid, rendered as a war.
+//
+// Every trade names an aggressor. side "B" = a buyer lifted the offer (a bull
+// swings); side "A" = a seller hit the bid (a bear swings). Trade notional is
+// how hard the punch lands. No server, no key — the browser talks to the
+// exchange directly.
+// ---------------------------------------------------------------------------
+
+const COINS = ["BTC", "ETH", "SOL", "HYPE", "DOGE", "XRP"];
+const WS_URL = "wss://api.hyperliquid.xyz/ws";
+
+// --- themes ---------------------------------------------------------------
+// The engine only knows "side A" and "side B". Everything nameable lives here,
+// so a new skin is a data change, not a code change. Add one, reload with
+// ?theme=<key>.
+
+const THEMES = {
+  market: {
+    title: "Bulls vs Bears",
+    a: { name: "BULLS", unit: "bulls", rgb: "34,229,160" },
+    b: { name: "BEARS", unit: "bears", rgb: "255,77,106" },
+  },
+  gothic: {
+    title: "Werewolves vs Vampires",
+    a: { name: "WEREWOLVES", unit: "wolves", rgb: "180,220,90" },
+    b: { name: "VAMPIRES", unit: "vampires", rgb: "200,40,90" },
+  },
+  frost: {
+    title: "Frost vs Ember",
+    a: { name: "FROST", unit: "frost", rgb: "90,190,255" },
+    b: { name: "EMBER", unit: "ember", rgb: "255,140,50" },
+  },
+};
+
+const THEME = THEMES[new URLSearchParams(location.search).get("theme")] || THEMES.market;
+document.title = THEME.title + " — live perp tape";
+document.documentElement.style.setProperty("--bull", "rgb(" + THEME.a.rgb + ")");
+document.documentElement.style.setProperty("--bear", "rgb(" + THEME.b.rgb + ")");
+
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = cv.clientWidth; H = cv.clientHeight;
+  cv.width = W * DPR; cv.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener("resize", resize);
+resize();
+
+// --- state ----------------------------------------------------------------
+//
+// Two armies hold the field. Every aggressive trade is one side killing some
+// of the other, scaled by how much money was behind it. Both sides recruit
+// back toward their baseline, so the front line sways instead of running to
+// one end and stopping — a cumulative percentage freezes, a war doesn't.
+
+const BASE = 10000;          // baseline army size
+const RECRUIT = 0.014;       // fraction of the gap replaced each tick
+const KILL_PER_DOLLAR = 1 / 900;
+
+const S = {
+  trades: 0, vol: 0,
+  bulls: BASE, bears: BASE,
+  biggest: 0, biggestCoin: "",
+  tension: 0.5,        // smoothed 0..1 — where the front line sits
+  shake: 0,
+  recent: [],          // rolling 60s window of {t, bullish, notional, kills}
+};
+const shots = [];      // projectiles in flight
+const marks = [];      // impact flashes
+
+function trimWindow(now) {
+  const cut = now - 60000;
+  while (S.recent.length && S.recent[0].t < cut) S.recent.shift();
+}
+
+// --- rendering helpers ----------------------------------------------------
+const money = n =>
+  n >= 1e9 ? "$" + (n / 1e9).toFixed(2) + "B" :
+  n >= 1e6 ? "$" + (n / 1e6).toFixed(2) + "M" :
+  n >= 1e3 ? "$" + (n / 1e3).toFixed(1) + "K" :
+  "$" + n.toFixed(0);
+
+function spawn(bullish, notional, coin) {
+  // Punch strength: log-scaled so a $2M print reads bigger than a $2K one
+  // without making everything below $100K invisible.
+  const p = Math.min(1, Math.log10(1 + notional) / 6.2);
+  const r = 1.6 + p * 15;
+  const speed = 3.4 + p * 3.2;
+  const y = H * 0.5 + (Math.random() - 0.5) * H * 0.62;
+
+  shots.push({
+    bullish, r, speed, coin, notional,
+    x: bullish ? -20 : W + 20,
+    y,
+    vy: (Math.random() - 0.5) * 0.8,
+    life: 1,
+    big: notional > 250000,
+  });
+  if (notional > 250000) S.shake = Math.min(16, S.shake + p * 14);
+}
+
+function step() {
+  // armies recruit back toward baseline so the fight never truly ends
+  S.bulls += (BASE - S.bulls) * RECRUIT;
+  S.bears += (BASE - S.bears) * RECRUIT;
+
+  // front line follows the balance of surviving forces
+  const total = S.bulls + S.bears;
+  const target = total ? S.bulls / total : 0.5;
+  S.tension += (target - S.tension) * 0.05;
+
+  // backdrop — tinted by whoever currently dominates
+  const t = S.tension;
+  ctx.fillStyle = "#07090d";
+  ctx.fillRect(0, 0, W, H);
+
+  const g = ctx.createLinearGradient(0, 0, W, 0);
+  g.addColorStop(0, "rgba(" + THEME.a.rgb + "," + (0.05 + t * 0.16).toFixed(3) + ")");
+  g.addColorStop(0.5, "rgba(0,0,0,0)");
+  g.addColorStop(1, "rgba(" + THEME.b.rgb + "," + (0.05 + (1 - t) * 0.16).toFixed(3) + ")");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  // battle line — sits where the balance of force is
+  const lineX = W * t;
+  ctx.save();
+  if (S.shake > 0.2) {
+    ctx.translate((Math.random() - 0.5) * S.shake, (Math.random() - 0.5) * S.shake);
+    S.shake *= 0.86;
+  }
+
+  ctx.strokeStyle = "rgba(232,236,241,.16)";
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(lineX, 74); ctx.lineTo(lineX, H); ctx.stroke();
+
+  // impact flashes
+  for (let i = marks.length - 1; i >= 0; i--) {
+    const m = marks[i];
+    m.life -= 0.045;
+    if (m.life <= 0) { marks.splice(i, 1); continue; }
+    ctx.beginPath();
+    ctx.arc(m.x, m.y, m.r * (2.4 - m.life * 1.4), 0, 6.284);
+    ctx.strokeStyle = "rgba(" + (m.bullish ? THEME.a.rgb : THEME.b.rgb) + "," + m.life.toFixed(3) + ")";
+    ctx.lineWidth = 1.6;
+    ctx.stroke();
+  }
+
+  // projectiles
+  for (let i = shots.length - 1; i >= 0; i--) {
+    const s = shots[i];
+    s.x += s.bullish ? s.speed : -s.speed;
+    s.y += s.vy;
+
+    const hit = s.bullish ? s.x >= lineX : s.x <= lineX;
+    if (hit) {
+      marks.push({ x: lineX, y: s.y, r: s.r, bullish: s.bullish, life: 1 });
+      shots.splice(i, 1);
+      continue;
+    }
+    if (s.x < -60 || s.x > W + 60) { shots.splice(i, 1); continue; }
+
+    const col = s.bullish ? THEME.a.rgb : THEME.b.rgb;
+    // tracer
+    const tail = s.r * 3.4;
+    const tg = ctx.createLinearGradient(s.x - (s.bullish ? tail : -tail), 0, s.x, 0);
+    tg.addColorStop(0, "rgba(" + col + ",0)");
+    tg.addColorStop(1, "rgba(" + col + ",.5)");
+    ctx.strokeStyle = tg;
+    ctx.lineWidth = s.r * 0.85;
+    ctx.beginPath();
+    ctx.moveTo(s.x - (s.bullish ? tail : -tail), s.y);
+    ctx.lineTo(s.x, s.y);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.r, 0, 6.284);
+    ctx.fillStyle = "rgba(" + col + ",.92)";
+    ctx.fill();
+
+    if (s.big) {
+      ctx.font = "600 10px ui-sans-serif, system-ui, sans-serif";
+      ctx.fillStyle = "rgba(" + col + ",.75)";
+      ctx.textAlign = s.bullish ? "right" : "left";
+      ctx.fillText(s.coin, s.x + (s.bullish ? -s.r - 6 : s.r + 6), s.y + 3);
+    }
+  }
+  ctx.restore();
+  requestAnimationFrame(step);
+}
+requestAnimationFrame(step);
+
+// --- DOM plumbing ---------------------------------------------------------
+const $ = id => document.getElementById(id);
+const feed = $("feed");
+$("title").textContent = THEME.title;
+$("aName").textContent = THEME.a.name;
+$("bName").textContent = THEME.b.name;
+$("aKillLbl").textContent = THEME.a.unit;
+$("bKillLbl").textContent = THEME.b.unit;
+
+function paintStats() {
+  trimWindow(Date.now());
+  let bullKills = 0, bearKills = 0;
+  for (const r of S.recent) {
+    if (r.bullish) bullKills += r.kills; else bearKills += r.kills;
+  }
+
+  $("nTrades").textContent = S.trades.toLocaleString();
+  $("vol").textContent = money(S.vol);
+  $("bullVol").textContent = Math.round(bullKills).toLocaleString();
+  $("bearVol").textContent = Math.round(bearKills).toLocaleString();
+  if (S.biggest) $("biggest").textContent = money(S.biggest) + " " + S.biggestCoin;
+
+  $("bullArmy").textContent = Math.round(S.bulls).toLocaleString();
+  $("bearArmy").textContent = Math.round(S.bears).toLocaleString();
+
+  const tot = S.bulls + S.bears;
+  $("bar").style.width = ((tot ? S.bulls / tot : 0.5) * 100).toFixed(1) + "%";
+}
+
+function pushKill(bullish, coin, notional, kills) {
+  const el = document.createElement("div");
+  el.className = "kill " + (bullish ? "bull" : "bear") + (notional > 250000 ? " big" : "");
+  el.innerHTML = '<span class="coin">' + coin + "</span>" +
+                 '<span class="amt">' + money(notional) + " · " +
+                 Math.round(kills).toLocaleString() +
+                 (bullish ? " " + THEME.b.unit : " " + THEME.a.unit) + " down</span>";
+  feed.appendChild(el);
+  while (feed.children.length > 13) feed.removeChild(feed.firstChild);
+}
+
+// --- the tape -------------------------------------------------------------
+let ws, retry = 0;
+
+function connect() {
+  $("stat").textContent = "connecting…";
+  $("dot").className = "dot";
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    retry = 0;
+    $("stat").textContent = "live · hyperliquid";
+    $("dot").className = "dot live";
+    for (const coin of COINS) {
+      ws.send(JSON.stringify({ method: "subscribe", subscription: { type: "trades", coin } }));
+    }
+  };
+
+  ws.onmessage = ev => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (msg.channel !== "trades" || !Array.isArray(msg.data)) return;
+
+    const hint = $("hint");
+    if (hint) hint.remove();
+
+    for (const t of msg.data) {
+      // "B" = buyer was the aggressor (bull). "A" = seller was (bear).
+      const bullish = t.side === "B";
+      const notional = parseFloat(t.px) * parseFloat(t.sz);
+      if (!isFinite(notional)) continue;
+
+      S.trades++;
+      S.vol += notional;
+      if (notional > S.biggest) { S.biggest = notional; S.biggestCoin = t.coin; }
+
+      // this trade kills members of the opposing army
+      const kills = Math.max(1, notional * KILL_PER_DOLLAR);
+      if (bullish) S.bears = Math.max(0, S.bears - kills);
+      else         S.bulls = Math.max(0, S.bulls - kills);
+
+      S.recent.push({ t: Date.now(), bullish, notional, kills });
+
+      spawn(bullish, notional, t.coin);
+      if (notional > 15000) pushKill(bullish, t.coin, notional, kills);
+    }
+
+    paintStats();
+  };
+
+  ws.onclose = () => {
+    $("stat").textContent = "reconnecting…";
+    $("dot").className = "dot dead";
+    retry = Math.min(retry + 1, 6);
+    setTimeout(connect, 400 * Math.pow(2, retry));
+  };
+  ws.onerror = () => ws.close();
+}
+connect();
+</script>
+</body>
+</html>

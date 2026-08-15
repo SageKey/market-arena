@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bulls vs Bears — live tape</title>
+<style>
+  :root {
+    --a: #22e5a0;
+    --b: #ff4d6a;
+    --ink: #e8ecf1;
+    --dim: #7c8798;
+    --bg: #06080b;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 400 14px/1.45 ui-sans-serif, -apple-system, "SF Pro Text", Inter, system-ui, sans-serif;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  .layer { position: fixed; inset: 0; pointer-events: none; }
+
+  header {
+    position: fixed; top: 0; left: 0; right: 0;
+    display: flex; align-items: baseline; gap: 14px; padding: 18px 22px;
+  }
+  h1 { font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+  .status { font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 6px; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--dim); }
+  .dot.live { background: var(--a); box-shadow: 0 0 8px var(--a); }
+  .dot.dead { background: var(--b); }
+
+  .meter-wrap { position: fixed; top: 54px; left: 22px; right: 22px; }
+  .meter { height: 3px; border-radius: 2px; background: var(--b); overflow: hidden; }
+  .meter > i { display: block; height: 100%; background: var(--a); width: 50%; transition: width .4s cubic-bezier(.4,0,.2,1); }
+  .meter-labels { display: flex; justify-content: space-between; margin-top: 7px; font-size: 12px; font-weight: 500; }
+  .a-t { color: var(--a); } .b-t { color: var(--b); }
+  .num { font-variant-numeric: tabular-nums; }
+
+  .board {
+    position: fixed; left: 22px; bottom: 20px; font-size: 12px; color: var(--dim);
+    display: grid; grid-template-columns: auto auto; gap: 3px 16px;
+    background: rgba(6,8,11,.72); padding: 10px 14px; border-radius: 8px;
+    backdrop-filter: blur(6px);
+  }
+  .board b { color: var(--ink); font-weight: 500; font-variant-numeric: tabular-nums; }
+  .dimspan { opacity: .5; }
+
+  .feed {
+    position: fixed; right: 22px; bottom: 20px; width: 268px;
+    display: flex; flex-direction: column-reverse; gap: 3px;
+    font-size: 12px; font-variant-numeric: tabular-nums;
+  }
+  .kill {
+    display: flex; justify-content: space-between; gap: 10px;
+    padding: 5px 9px; border-radius: 5px;
+    background: rgba(6,8,11,.8); border-left: 2px solid var(--dim);
+    backdrop-filter: blur(6px);
+    animation: slide .28s cubic-bezier(.2,0,0,1);
+  }
+  .kill.a { border-left-color: var(--a); }
+  .kill.b { border-left-color: var(--b); }
+  .kill .coin { color: var(--ink); font-weight: 500; }
+  .kill .amt { color: var(--dim); white-space: nowrap; }
+  .kill.big { background: rgba(20,24,30,.92); }
+  .kill.big .amt { color: var(--ink); }
+  @keyframes slide { from { opacity: 0; transform: translateX(14px); } }
+
+  .hint { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%); color: var(--dim); font-size: 13px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="layer">
+  <header>
+    <h1 id="title">Bulls vs Bears</h1>
+    <span class="status"><span class="dot" id="dot"></span><span id="stat">connecting…</span></span>
+  </header>
+
+  <div class="meter-wrap">
+    <div class="meter"><i id="bar"></i></div>
+    <div class="meter-labels">
+      <span class="a-t"><span id="aName">BULLS</span> <span class="num" id="aArmy">10,000</span></span>
+      <span class="b-t"><span class="num" id="bArmy">10,000</span> <span id="bName">BEARS</span></span>
+    </div>
+  </div>
+
+  <div class="board">
+    <span>trades</span><b id="nTrades">0</b>
+    <span>volume</span><b id="vol">$0</b>
+    <span><span id="aKillLbl">bull</span> kills <span class="dimspan">60s</span></span><b id="aKills">0</b>
+    <span><span id="bKillLbl">bear</span> kills <span class="dimspan">60s</span></span><b id="bKills">0</b>
+    <span>biggest hit</span><b id="biggest">—</b>
+  </div>
+
+  <div class="feed" id="feed"></div>
+  <div class="hint" id="hint">waiting for the tape…</div>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// Two pixel armies fight on live exchange data.
+//
+// Every trade on a public feed names an aggressor — whoever crossed the spread.
+// Aggressive buys send faction A's soldiers firing; aggressive sells send
+// faction B's. Trade notional decides how many of them pull the trigger.
+//
+// Two exchanges feed the battle at once (Coinbase spot + Hyperliquid perps),
+// roughly 17 trades/sec between them. Browser talks to both directly — no
+// server, no API key, no dependencies.
+// ---------------------------------------------------------------------------
+
+// --- sprites --------------------------------------------------------------
+// 11x18 pixel grids, drawn facing right and mirrored for the other side.
+//   .  transparent   1 body   2 outline   3 highlight   4 eye   5 weapon
+// Authored and eyeballed as text first (see sprites.py).
+
+const ART = {
+  wolf: [
+    ".2.......2.", ".22.....22.", ".232...232.", ".2321.2232.",
+    ".23111132..", ".2411111 2.", ".23111114 2", "..2311132..",
+    "...22122...", "..2311132..", ".231111132.", "231111111 5",
+    ".23111132..", ".2311132...", ".231.132...", ".23...32...",
+    ".22...22...", "222...222..",
+  ],
+  vampire: [
+    "...22222...", "..2333332..", "..2343432..", "..2333332..",
+    "...23332...", "....212....", "..2311132..", ".2231111322",
+    "231111111 2", "23111111 55", "231111111 2", ".2311111 2.",
+    "..23111 2..", "..231132...", "..231.32...", "..23..32...",
+    "..22..22...", ".222..222..",
+  ],
+  bull: [
+    "3.........3", "23.......32", ".23.....32.", "..2333332..",
+    "..2341432..", "..2333332..", "...23332...", "....212....",
+    "..2311132..", ".231111132.", "23111111 55", ".231111132.",
+    "..23111 2..", "..231132...", "..231.32...", "..23..32...",
+    "..22..22...", ".222..222..",
+  ],
+  bear: [
+    "..22...22..", ".2332.2332.", ".2332.2332.", "..2333332..",
+    "..2341432..", "..2333332..", "...23432...", "....212....",
+    "..2311132..", ".231111132.", "23111111 55", ".231111132.",
+    "..23111 2..", "..231132...", "..231.32...", "..23..32...",
+    "..22..22...", ".222..222..",
+  ],
+};
+
+const THEMES = {
+  market: {
+    title: "Bulls vs Bears",
+    a: { name: "BULLS", unit: "bulls", rgb: "34,229,160", art: "bull" },
+    b: { name: "BEARS", unit: "bears", rgb: "255,77,106", art: "bear" },
+  },
+  gothic: {
+    title: "Werewolves vs Vampires",
+    a: { name: "WEREWOLVES", unit: "wolves", rgb: "168,222,88", art: "wolf" },
+    b: { name: "VAMPIRES", unit: "vampires", rgb: "226,42,96", art: "vampire" },
+  },
+  frost: {
+    title: "Frost vs Ember",
+    a: { name: "FROST", unit: "frost", rgb: "96,196,255", art: "wolf" },
+    b: { name: "EMBER", unit: "ember", rgb: "255,142,48", art: "vampire" },
+  },
+};
+
+const THEME = THEMES[new URLSearchParams(location.search).get("theme")] || THEMES.market;
+document.title = THEME.title + " — live tape";
+document.documentElement.style.setProperty("--a", "rgb(" + THEME.a.rgb + ")");
+document.documentElement.style.setProperty("--b", "rgb(" + THEME.b.rgb + ")");
+
+const PX = 3;                        // pixel scale
+const SW = 11 * PX, SH = 18 * PX;    // sprite size on screen
+
+function shade(rgb, mul, mix) {
+  const p = rgb.split(",").map(Number);
+  return "rgb(" + p.map(v =>
+    Math.max(0, Math.min(255, Math.round(v * mul + (mix || 0))))).join(",") + ")";
+}
+
+// Bake each sprite once into its own canvas — per-pixel fillRect across ~90
+// sprites every frame would not hold 60fps.
+function bake(artName, rgb, flip) {
+  const rows = ART[artName];
+  const cvs = document.createElement("canvas");
+  cvs.width = 11 * PX; cvs.height = 18 * PX;
+  const c = cvs.getContext("2d");
+  const pal = {
+    "1": shade(rgb, 1),
+    "2": shade(rgb, 0.34),
+    "3": shade(rgb, 1.25, 30),
+    "4": "#ffffff",
+    "5": "#c9d2dd",
+  };
+  for (let y = 0; y < rows.length; y++) {
+    for (let x = 0; x < rows[y].length; x++) {
+      const ch = rows[y][x];
+      const col = pal[ch];
+      if (!col) continue;
+      const px = flip ? (10 - x) : x;
+      c.fillStyle = col;
+      c.fillRect(px * PX, y * PX, PX, PX);
+    }
+  }
+  return cvs;
+}
+
+const SPRITE = {
+  0: bake(THEME.a.art, THEME.a.rgb, false),   // side A faces right
+  1: bake(THEME.b.art, THEME.b.rgb, true),    // side B faces left
+};
+
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+ctx.imageSmoothingEnabled = false;
+let W = 0, H = 0;
+
+// --- armies ---------------------------------------------------------------
+// The counters are the real army size; the sprites are a company standing in
+// for the whole force. They die on every trade and reinforcements march up.
+
+const BASE = 10000;
+const RECRUIT = 0.012;
+const KILL_PER_DOLLAR = 1 / 900;
+const RANKS = 4, FILES = 7;
+
+const S = {
+  trades: 0, vol: 0, aArmy: BASE, bArmy: BASE,
+  biggest: 0, biggestCoin: "", front: 0.5, shake: 0, recent: [],
+};
+
+const units = [];
+const beams = [];
+const bits = [];
+
+function layout() {
+  W = cv.clientWidth; H = cv.clientHeight;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+
+  const top = 118, bot = H - 108;
+  const usable = Math.max(160, bot - top);
+  units.length = 0;
+  for (const side of [0, 1]) {
+    for (let r = 0; r < RANKS; r++) {
+      for (let f = 0; f < FILES; f++) {
+        const depth = r / Math.max(1, RANKS - 1);
+        const homeX = side === 0
+          ? W * 0.08 + depth * W * 0.26
+          : W * 0.92 - depth * W * 0.26;
+        const y = top + (usable * (f + 0.5)) / FILES + (r % 2 ? 11 : -11);
+        units.push({
+          side, homeX, x: homeX, y, depth, rank: r,
+          alive: true, dying: 0, respawn: 0,
+          bob: Math.random() * 6.283, recoil: 0,
+        });
+      }
+    }
+  }
+}
+window.addEventListener("resize", layout);
+
+const money = n =>
+  n >= 1e9 ? "$" + (n / 1e9).toFixed(2) + "B" :
+  n >= 1e6 ? "$" + (n / 1e6).toFixed(2) + "M" :
+  n >= 1e3 ? "$" + (n / 1e3).toFixed(1) + "K" :
+  "$" + n.toFixed(0);
+
+function pick(side) {
+  const pool = [];
+  for (const u of units) if (u.side === side && u.alive && !u.dying) pool.push(u);
+  return pool.length ? pool[(Math.random() * pool.length) | 0] : null;
+}
+
+// --- combat ---------------------------------------------------------------
+function volley(attackerSide, notional) {
+  const shots = Math.max(1, Math.min(6, Math.round(Math.log10(1 + notional) - 1.6)));
+  const heavy = notional > 120000;
+
+  for (let i = 0; i < shots; i++) {
+    const shooter = pick(attackerSide);
+    const target = pick(1 - attackerSide);
+    if (!shooter || !target) break;
+    shooter.recoil = 1;
+    beams.push({
+      x1: shooter.x + (attackerSide === 0 ? SW * 0.46 : -SW * 0.46),
+      y1: shooter.y - SH * 0.16,
+      x2: target.x, y2: target.y - SH * 0.16,
+      t: 0, speed: 0.045 + Math.random() * 0.035,
+      rgb: attackerSide === 0 ? THEME.a.rgb : THEME.b.rgb,
+      heavy, target,
+    });
+  }
+  if (heavy) S.shake = Math.min(14, S.shake + 8);
+}
+
+function slay(u, rgb) {
+  if (!u || !u.alive || u.dying) return;
+  u.dying = 1;
+  for (let i = 0; i < 14; i++) {
+    bits.push({
+      x: u.x, y: u.y - SH * 0.3,
+      vx: (Math.random() - 0.5) * 4,
+      vy: -Math.random() * 3 - 0.4,
+      life: 1, rgb,
+    });
+  }
+}
+
+// --- frame ----------------------------------------------------------------
+function frame() {
+  S.aArmy += (BASE - S.aArmy) * RECRUIT;
+  S.bArmy += (BASE - S.bArmy) * RECRUIT;
+  const tot = S.aArmy + S.bArmy;
+  S.front += ((tot ? S.aArmy / tot : 0.5) - S.front) * 0.045;
+
+  ctx.fillStyle = "#06080b";
+  ctx.fillRect(0, 0, W, H);
+
+  const g = ctx.createLinearGradient(0, 0, W, 0);
+  g.addColorStop(0, "rgba(" + THEME.a.rgb + "," + (0.05 + S.front * 0.13).toFixed(3) + ")");
+  g.addColorStop(0.5, "rgba(0,0,0,0)");
+  g.addColorStop(1, "rgba(" + THEME.b.rgb + "," + (0.05 + (1 - S.front) * 0.13).toFixed(3) + ")");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  ctx.save();
+  if (S.shake > 0.3) {
+    ctx.translate((Math.random() - 0.5) * S.shake, (Math.random() - 0.5) * S.shake);
+    S.shake *= 0.87;
+  }
+
+  const push = (S.front - 0.5) * W * 0.1;
+  for (const u of units) {
+    u.bob += 0.04;
+    if (u.recoil > 0) u.recoil = Math.max(0, u.recoil - 0.08);
+
+    if (u.dying) {
+      u.dying -= 0.03;
+      if (u.dying <= 0) { u.dying = 0; u.alive = false; u.respawn = 70 + Math.random() * 90; }
+    } else if (!u.alive) {
+      u.respawn -= 1;
+      if (u.respawn <= 0) { u.alive = true; u.x = u.homeX - (u.side === 0 ? 80 : -80); }
+    }
+    u.x += ((u.homeX + push) - u.x) * 0.045;
+  }
+
+  // back ranks first so the front rank overlaps correctly
+  for (let r = RANKS - 1; r >= 0; r--) {
+    for (const u of units) {
+      if (u.rank !== r || (!u.alive && !u.dying)) continue;
+      const img = SPRITE[u.side];
+      const bob = Math.sin(u.bob) * 1.6;
+      const kick = u.recoil * 4 * (u.side === 0 ? -1 : 1);
+
+      ctx.save();
+      ctx.translate(u.x + kick, u.y + bob);
+      ctx.globalAlpha = u.dying ? u.dying : (0.55 + (1 - u.depth) * 0.45);
+      if (u.dying) ctx.rotate((u.side === 0 ? 1 : -1) * (1 - u.dying) * 1.5);
+      ctx.drawImage(img, -SW / 2, -SH);
+      ctx.restore();
+
+      if (u.recoil > 0.5) {            // muzzle flash at the barrel
+        const fx = u.x + kick + (u.side === 0 ? SW * 0.52 : -SW * 0.52);
+        ctx.beginPath();
+        ctx.arc(fx, u.y + bob - SH * 0.16, 4.4 * u.recoil, 0, 6.283);
+        ctx.fillStyle = "rgba(255,255,255," + (u.recoil * 0.9).toFixed(2) + ")";
+        ctx.fill();
+      }
+    }
+  }
+
+  // tracer fire
+  for (let i = beams.length - 1; i >= 0; i--) {
+    const b = beams[i];
+    b.t += b.speed;
+    if (b.t >= 1) { slay(b.target, b.rgb); beams.splice(i, 1); continue; }
+    const hx = b.x1 + (b.x2 - b.x1) * b.t, hy = b.y1 + (b.y2 - b.y1) * b.t;
+    const tt = Math.max(0, b.t - 0.16);
+    const tx = b.x1 + (b.x2 - b.x1) * tt, ty = b.y1 + (b.y2 - b.y1) * tt;
+
+    ctx.strokeStyle = "rgba(" + b.rgb + ",.92)";
+    ctx.lineWidth = b.heavy ? 3 : 1.6;
+    ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(hx, hy); ctx.stroke();
+    if (b.heavy) {
+      ctx.beginPath(); ctx.arc(hx, hy, 3.4, 0, 6.283);
+      ctx.fillStyle = "rgba(255,255,255,.92)"; ctx.fill();
+    }
+  }
+
+  for (let i = bits.length - 1; i >= 0; i--) {
+    const p = bits[i];
+    p.x += p.vx; p.y += p.vy; p.vy += 0.15; p.life -= 0.024;
+    if (p.life <= 0) { bits.splice(i, 1); continue; }
+    ctx.fillStyle = "rgba(" + p.rgb + "," + p.life.toFixed(3) + ")";
+    ctx.fillRect(p.x, p.y, PX, PX);
+  }
+
+  ctx.restore();
+  requestAnimationFrame(frame);
+}
+
+// --- DOM ------------------------------------------------------------------
+const $ = id => document.getElementById(id);
+const feed = $("feed");
+$("title").textContent = THEME.title;
+$("aName").textContent = THEME.a.name;
+$("bName").textContent = THEME.b.name;
+$("aKillLbl").textContent = THEME.a.unit;
+$("bKillLbl").textContent = THEME.b.unit;
+
+function paintStats() {
+  const cut = Date.now() - 60000;
+  while (S.recent.length && S.recent[0].t < cut) S.recent.shift();
+  let aK = 0, bK = 0;
+  for (const r of S.recent) { if (r.aSide) aK += r.kills; else bK += r.kills; }
+
+  $("nTrades").textContent = S.trades.toLocaleString();
+  $("vol").textContent = money(S.vol);
+  $("aKills").textContent = Math.round(aK).toLocaleString();
+  $("bKills").textContent = Math.round(bK).toLocaleString();
+  if (S.biggest) $("biggest").textContent = money(S.biggest) + " " + S.biggestCoin;
+  $("aArmy").textContent = Math.round(S.aArmy).toLocaleString();
+  $("bArmy").textContent = Math.round(S.bArmy).toLocaleString();
+  const tot = S.aArmy + S.bArmy;
+  $("bar").style.width = ((tot ? S.aArmy / tot : 0.5) * 100).toFixed(1) + "%";
+}
+
+function pushKill(aSide, coin, notional, kills) {
+  const el = document.createElement("div");
+  el.className = "kill " + (aSide ? "a" : "b") + (notional > 250000 ? " big" : "");
+  el.innerHTML = '<span class="coin">' + coin + "</span>" +
+    '<span class="amt">' + money(notional) + " · " + Math.round(kills).toLocaleString() +
+    " " + (aSide ? THEME.b.unit : THEME.a.unit) + " down</span>";
+  feed.appendChild(el);
+  while (feed.children.length > 11) feed.removeChild(feed.firstChild);
+}
+
+// One normalised entry point, whichever exchange the trade came from.
+function onTrade(aSide, coin, notional) {
+  if (!isFinite(notional) || notional <= 0) return;
+  const hint = $("hint"); if (hint) hint.remove();
+
+  S.trades++; S.vol += notional;
+  if (notional > S.biggest) { S.biggest = notional; S.biggestCoin = coin; }
+
+  const kills = Math.max(1, notional * KILL_PER_DOLLAR);
+  if (aSide) S.bArmy = Math.max(0, S.bArmy - kills);
+  else       S.aArmy = Math.max(0, S.aArmy - kills);
+  S.recent.push({ t: Date.now(), aSide, kills });
+
+  volley(aSide ? 0 : 1, notional);
+  if (notional > 15000) pushKill(aSide, coin, notional, kills);
+}
+
+// --- feeds ----------------------------------------------------------------
+const live = { hl: false, cb: false };
+function paintStatus() {
+  const on = [live.cb && "coinbase", live.hl && "hyperliquid"].filter(Boolean);
+  $("stat").textContent = on.length ? "live · " + on.join(" + ") : "connecting…";
+  $("dot").className = "dot " + (on.length ? "live" : "dead");
+}
+
+function connectHyperliquid() {
+  const coins = ["BTC", "ETH", "SOL", "HYPE", "DOGE", "XRP"];
+  const ws = new WebSocket("wss://api.hyperliquid.xyz/ws");
+  ws.onopen = () => {
+    live.hl = true; paintStatus();
+    for (const c of coins) {
+      ws.send(JSON.stringify({ method: "subscribe", subscription: { type: "trades", coin: c } }));
+    }
+  };
+  ws.onmessage = ev => {
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.channel !== "trades" || !Array.isArray(m.data)) return;
+    for (const t of m.data) {
+      // "B" = a buyer lifted the offer, so the aggressor is bullish
+      onTrade(t.side === "B", t.coin, parseFloat(t.px) * parseFloat(t.sz));
+    }
+    paintStats();
+  };
+  ws.onclose = () => { live.hl = false; paintStatus(); setTimeout(connectHyperliquid, 2500); };
+  ws.onerror = () => ws.close();
+}
+
+function connectCoinbase() {
+  const pairs = ["BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD", "XRP-USD", "LTC-USD", "ADA-USD"];
+  const ws = new WebSocket("wss://ws-feed.exchange.coinbase.com");
+  ws.onopen = () => {
+    live.cb = true; paintStatus();
+    ws.send(JSON.stringify({ type: "subscribe", product_ids: pairs, channels: ["matches"] }));
+  };
+  ws.onmessage = ev => {
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.type !== "match" && m.type !== "last_match") return;
+    // Coinbase reports the MAKER's side, so the aggressor is the opposite:
+    // maker "sell" means the taker bought — a bullish aggressor.
+    const aSide = m.side === "sell";
+    onTrade(aSide, (m.product_id || "").split("-")[0],
+            parseFloat(m.price) * parseFloat(m.size));
+    paintStats();
+  };
+  ws.onclose = () => { live.cb = false; paintStatus(); setTimeout(connectCoinbase, 2500); };
+  ws.onerror = () => ws.close();
+}
+
+layout();
+requestAnimationFrame(frame);
+connectCoinbase();
+connectHyperliquid();
+</script>
+</body>
+</html>
