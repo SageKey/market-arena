@@ -21,7 +21,8 @@
     overflow: hidden;
     -webkit-font-smoothing: antialiased;
   }
-  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  /* battlefield only — scoped so the chart canvas is not swallowed by it */
+  #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
   .layer { position: fixed; inset: 0; pointer-events: none; }
 
   header {
@@ -70,6 +71,21 @@
   .kill.big .amt { color: var(--ink); }
   @keyframes slide { from { opacity: 0; transform: translateX(14px); } }
 
+  .price {
+    position: fixed; left: 50%; transform: translateX(-50%); top: 86px;
+    background: rgba(6,8,11,.8); border-radius: 9px; padding: 9px 16px 7px;
+    backdrop-filter: blur(6px); text-align: center; width: 292px;
+  }
+  .prow { display: flex; align-items: baseline; justify-content: center; gap: 7px; }
+  .plabel { font-size: 10px; color: var(--dim); letter-spacing: .1em; }
+  .pnow { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .pchg { font-size: 11px; font-variant-numeric: tabular-nums; }
+  #spark { display: block; width: 260px; height: 44px; margin: 5px auto 0; }
+  .legend { display: flex; gap: 13px; justify-content: center; margin-top: 3px; font-size: 9px; color: var(--dim); }
+  .legend i { display: inline-block; width: 8px; height: 2px; margin-right: 4px; vertical-align: middle; }
+  .sw-px { background: #e8ecf1; }
+  .sw-cvd { background: #8b7cf6; }
+
   .hint { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%); color: var(--dim); font-size: 13px; }
 </style>
 </head>
@@ -94,9 +110,22 @@
     <span>trades</span><b id="nTrades">0</b>
     <span>volume</span><b id="vol">$0</b>
     <span>market <span class="dimspan">3m</span></span><b id="drift">—</b>
-    <span>buys <span class="dimspan">60s</span></span><b id="aKills">0</b>
-    <span>sells <span class="dimspan">60s</span></span><b id="bKills">0</b>
+    <span>buy pressure</span><b id="aKills">$0</b>
+    <span>sell pressure</span><b id="bKills">$0</b>
     <span>biggest hit</span><b id="biggest">—</b>
+  </div>
+
+  <div class="price">
+    <div class="prow">
+      <span class="plabel">BTC</span>
+      <span class="pnow" id="btcPx">—</span>
+      <span class="pchg" id="btcChg"></span>
+    </div>
+    <canvas id="spark" width="520" height="88"></canvas>
+    <div class="legend">
+      <span><i class="sw-px"></i>price</span>
+      <span><i class="sw-cvd"></i>cumulative volume delta</span>
+    </div>
   </div>
 
   <div class="feed" id="feed"></div>
@@ -235,6 +264,14 @@ const S = {
   biggest: 0, biggestCoin: "", front: 0.5, shake: 0, recent: [],
   px: {},                    // coin -> [{t, p}, ...] trimmed to LOOKBACK
   drift: 0,                  // smoothed aggregate % change
+
+  // BTC gets its own record for the chart. Cumulative volume delta is buy
+  // notional minus sell notional, never reset — the running total is the
+  // point. A 60-second window only ever shows a snapshot, and trade COUNTS
+  // are close to meaningless: retail buys are many and small, institutional
+  // sells are few and large, so counting prints tells you nothing about price.
+  btc: { px: null, open: null, cvd: 0, series: [], lastSample: 0 },
+  buyVol: 0, sellVol: 0,
 };
 
 // Price is the war. Every coin contributes its move over the window; the
@@ -450,13 +487,24 @@ $("bName").textContent = THEME.b.name;
 function paintStats() {
   const cut = Date.now() - 60000;
   while (S.recent.length && S.recent[0].t < cut) S.recent.shift();
-  let aK = 0, bK = 0;
-  for (const r of S.recent) { if (r.aSide) aK++; else bK++; }
 
   $("nTrades").textContent = S.trades.toLocaleString();
   $("vol").textContent = money(S.vol);
-  $("aKills").textContent = Math.round(aK).toLocaleString();
-  $("bKills").textContent = Math.round(bK).toLocaleString();
+  $("aKills").textContent = money(S.buyVol);
+  $("bKills").textContent = money(S.sellVol);
+
+  const b = S.btc;
+  if (b.px) {
+    $("btcPx").textContent = "$" + b.px.toLocaleString(undefined,
+      { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+    if (b.open) {
+      const pc = ((b.px - b.open) / b.open) * 100;
+      const el = $("btcChg");
+      el.textContent = (pc >= 0 ? "+" : "") + pc.toFixed(2) + "%";
+      el.style.color = pc >= 0 ? "var(--a)" : "var(--b)";
+    }
+  }
+  drawSpark();
   if (S.biggest) $("biggest").textContent = money(S.biggest) + " " + S.biggestCoin;
   const d = S.drift * 100;
   const dEl = $("drift");
@@ -468,6 +516,55 @@ function paintStats() {
   $("bar").style.width = ((tot ? S.aArmy / tot : 0.5) * 100).toFixed(1) + "%";
 }
 
+// Price and cumulative volume delta on shared time, separately scaled. They
+// are different units, so what matters is the SHAPE: when price climbs while
+// CVD falls, buyers are being absorbed and the move is not supported.
+const spark = document.getElementById("spark");
+const sctx = spark.getContext("2d");
+
+function drawSpark() {
+  const pts = S.btc.series;
+  const w = spark.width, h = spark.height, pad = 4;
+  sctx.clearRect(0, 0, w, h);
+  if (pts.length < 2) {
+    sctx.fillStyle = "rgba(124,135,152,.7)";
+    sctx.font = "20px ui-sans-serif, system-ui, sans-serif";
+    sctx.textAlign = "center";
+    sctx.fillText("collecting…", w / 2, h / 2 + 8);
+    return;
+  }
+
+  // A floor on the range matters: auto-scaling a $5 move on a $63,000 price
+  // fills the chart height and makes a flat market look violent. The floor
+  // keeps a genuinely quiet tape looking quiet.
+  const line = (get, colour, width, minSpan) => {
+    let lo = Infinity, hi = -Infinity;
+    for (const q of pts) { const v = get(q); if (v < lo) lo = v; if (v > hi) hi = v; }
+    let span = hi - lo;
+    const floor = minSpan || 0;
+    if (span < floor) {
+      const mid = (hi + lo) / 2;
+      lo = mid - floor / 2; hi = mid + floor / 2; span = floor;
+    }
+    if (!span) span = 1;
+    sctx.beginPath();
+    pts.forEach((q, i) => {
+      const x = pad + (i / (pts.length - 1)) * (w - pad * 2);
+      const y = h - pad - ((get(q) - lo) / span) * (h - pad * 2);
+      i ? sctx.lineTo(x, y) : sctx.moveTo(x, y);
+    });
+    sctx.strokeStyle = colour;
+    sctx.lineWidth = width;
+    sctx.lineJoin = "round";
+    sctx.stroke();
+  };
+
+  const last = pts[pts.length - 1];
+  // 0.4% of price, and CVD scaled against total session flow
+  line(q => q.c, "#8b7cf6", 3, Math.max(1, (S.buyVol + S.sellVol) * 0.05));
+  line(q => q.p, "#e8ecf1", 3, last.p * 0.004);
+}
+
 function pushKill(aSide, coin, notional) {
   const el = document.createElement("div");
   el.className = "kill " + (aSide ? "a" : "b") + (notional > 250000 ? " big" : "");
@@ -475,7 +572,7 @@ function pushKill(aSide, coin, notional) {
     '<span class="amt">' + money(notional) + " " +
     (aSide ? "buy" : "sell") + "</span>";
   feed.appendChild(el);
-  while (feed.children.length > 5) feed.removeChild(feed.firstChild);
+  while (feed.children.length > 4) feed.removeChild(feed.firstChild);
 }
 
 // One normalised entry point, whichever exchange the trade came from.
@@ -486,7 +583,20 @@ function onTrade(aSide, coin, notional, price) {
 
   S.trades++; S.vol += notional;
   if (notional > S.biggest) { S.biggest = notional; S.biggestCoin = coin; }
-  S.recent.push({ t: Date.now(), aSide });
+  if (aSide) S.buyVol += notional; else S.sellVol += notional;
+
+  if (coin === "BTC" && isFinite(price) && price > 0) {
+    const b = S.btc;
+    b.px = price;
+    if (b.open === null) b.open = price;
+    b.cvd += aSide ? notional : -notional;
+    const now = Date.now();
+    if (now - b.lastSample > 2000) {
+      b.lastSample = now;
+      b.series.push({ t: now, p: price, c: b.cvd });
+      if (b.series.length > 400) b.series.shift();
+    }
+  }
 
   volley(aSide ? 0 : 1, notional);
   if (notional > 15000) pushKill(aSide, coin, notional);
